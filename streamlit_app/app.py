@@ -3,6 +3,7 @@ import pandas as pd
 import joblib
 import numpy as np
 import os
+import gdown
 import traceback
 
 # ==========================================================
@@ -13,7 +14,7 @@ st.set_page_config(page_title="💰 EMIPredict AI", layout="centered")
 st.title("💰 EMIPredict AI – Intelligent Financial Risk Assessment")
 st.markdown("""
 Predict EMI eligibility and maximum EMI limit using your financial data.  
-_Powered by AI models trained onpyth real credit datasets._
+_Powered by AI models trained on real credit datasets._
 """)
 
 # ==========================================================
@@ -23,7 +24,7 @@ _Powered by AI models trained onpyth real credit datasets._
 def load_model_from_drive(file_id, local_path):
     """Download and cache large models from Google Drive using gdown."""
     if not os.path.exists(local_path) or os.path.getsize(local_path) < 50_000_000:
-        url = f"C:\Users\jan23\Downloads\EMIPredictAI-main\EMIPredictAI-main\data\emi_prediction_dataset.csv"
+        url = f"https://drive.google.com/uc?id={file_id}"
         st.info(f"📥 Downloading {os.path.basename(local_path)}...")
         gdown.download(url, local_path, quiet=False, fuzzy=True)
         st.success(f"✅ Downloaded {os.path.basename(local_path)} "
