@@ -1,0 +1,11 @@
+# --- Core dependencies ---
+streamlit==1.39.0
+pandas==2.2.3
+numpy==2.1.2
+scikit-learn==1.5.2
+joblib==1.4.2
+gdown==5.2.0
+
+# --- Helpers ---
+requests==2.32.3
+typing-extensions>=4.12.2
