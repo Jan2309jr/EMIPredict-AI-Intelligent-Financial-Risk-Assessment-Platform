@@ -1,56 +1,194 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import joblib
 import numpy as np
 import os
-import gdown
 import traceback
 
-# ==========================================================
-# 💰 EMIPredict AI – Intelligent Financial Risk Assessment
-# ==========================================================
-st.set_page_config(page_title="💰 EMIPredict AI", layout="centered")
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 
+st.set_page_config(page_title="💰 EMIPredict AI", layout="centered")
 st.title("💰 EMIPredict AI – Intelligent Financial Risk Assessment")
 st.markdown("""
 Predict EMI eligibility and maximum EMI limit using your financial data.  
 _Powered by AI models trained on real credit datasets._
 """)
 
-# ==========================================================
-# 🔽 Google Drive Model Downloader (gdown)
-# ==========================================================
+# -------------------------
+# Paths (works when running from streamlit_app/)
+# -------------------------
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))  # project root
+DATA_PATH = os.path.join(BASE_DIR, "data", "emi_prediction_dataset.csv")
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+# -------------------------
+# Load dataset
+# -------------------------
+@st.cache_data
+def load_dataset(path=DATA_PATH):
+    if not os.path.exists(path):
+        st.error(f"Dataset not found at {path}")
+        st.stop()
+    df = pd.read_csv(path)
+    return df
+
+df = load_dataset()
+st.success(f"✅ Dataset loaded successfully from `{os.path.relpath(DATA_PATH)}`")
+st.dataframe(df.head())
+
+# -------------------------
+# Helper: preprocess & optional training
+# -------------------------
+def build_preprocessor(X: pd.DataFrame):
+    # numeric / categorical columns
+    numeric_cols = X.select_dtypes(include=["int64", "float64"]).columns.tolist()
+    categorical_cols = X.select_dtypes(include=["object"]).columns.tolist()
+
+    # Ensure categorical columns are strings to avoid mixed-type issues
+    # This does not modify the original df passed in by value when used correctly.
+    if len(categorical_cols) > 0:
+        X[categorical_cols] = X[categorical_cols].astype(str).fillna("missing")
+
+    num_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler())
+    ])
+
+    # OneHotEncoder param name differs across sklearn releases
+    try:
+        ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
+    except TypeError:
+        ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+
+    cat_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("ohe", ohe)
+    ])
+
+    preprocessor = ColumnTransformer([
+        ("num", num_pipe, numeric_cols),
+        ("cat", cat_pipe, categorical_cols)
+    ], sparse_threshold=0)
+
+    return preprocessor, numeric_cols, categorical_cols
+
+def prepare_training_data(df, target_clf="emi_eligibility", target_reg="max_monthly_emi", sample_size=20000, random_state=42):
+    df = df.copy()
+    df = df[df[target_clf].notna() & df[target_reg].notna()]
+
+    if df.shape[0] > sample_size:
+        df = df.sample(sample_size, random_state=random_state)
+
+    X = df.drop(columns=[target_clf, target_reg])
+    # identify categorical columns robustly (also include object-like numeric columns)
+    categorical_cols = X.select_dtypes(include=["object"]).columns.tolist()
+    # Coerce categorical columns to string and fill missing
+    if len(categorical_cols) > 0:
+        X[categorical_cols] = X[categorical_cols].astype(str).fillna("missing")
+
+    # For any remaining non-numeric columns, coerce as string too
+    non_numeric = [c for c in X.columns if X[c].dtype == "O" or X[c].dtype == "object"]
+    if non_numeric:
+        X[non_numeric] = X[non_numeric].astype(str).fillna("missing")
+
+    y_clf = df[target_clf].astype(str).str.strip()
+    y_reg = df[target_reg].astype(float)
+    return X, y_clf, y_reg
+# -------------------------
+# Train lightweight models if missing
+# -------------------------
+def train_and_save_models(df):
+    st.info("Training lightweight models because saved models are missing. This may take a short time.")
+    X, y_clf, y_reg = prepare_training_data(df)
+
+    # build preprocessor from X
+    preprocessor, num_cols, cat_cols = build_preprocessor(X)
+
+    # encode classification target
+    le = LabelEncoder()
+    y_clf_enc = le.fit_transform(y_clf)
+
+    # train-test split
+    X_train, X_val, yclf_train, yclf_val, yreg_train, yreg_val = train_test_split(
+        X, y_clf_enc, y_reg, test_size=0.2, random_state=42, stratify=y_clf_enc
+    )
+
+    # build pipelines
+    clf_pipeline = Pipeline([
+        ("pre", preprocessor),
+        ("clf", RandomForestClassifier(n_estimators=150, n_jobs=-1, random_state=42))
+    ])
+    reg_pipeline = Pipeline([
+        ("pre", preprocessor),
+        ("reg", RandomForestRegressor(n_estimators=150, n_jobs=-1, random_state=42))
+    ])
+
+    # fit
+    clf_pipeline.fit(X_train, yclf_train)
+    reg_pipeline.fit(X_train, yreg_train)
+
+    # Save pipelines and label encoder
+    joblib.dump(clf_pipeline, os.path.join(MODELS_DIR, "best_classifier.joblib"))
+    joblib.dump(reg_pipeline, os.path.join(MODELS_DIR, "best_regressor.joblib"))
+    joblib.dump(le, os.path.join(MODELS_DIR, "label_encoder.joblib"))
+    # Also save standalone encoder/scaler if user expects them (extract from preprocessor)
+    try:
+        # Save a copy of the fitted preprocessor so app can reuse it if needed
+        joblib.dump(preprocessor, os.path.join(MODELS_DIR, "preprocessor.joblib"))
+    except Exception:
+        pass
+
+    st.success("✅ Training completed and models saved to `models/`")
+    return clf_pipeline, reg_pipeline, le
+
+# -------------------------
+# Load or train models
+# -------------------------
 @st.cache_resource
-def load_model_from_drive(file_id, local_path):
-    """Download and cache large models from Google Drive using gdown."""
-    if not os.path.exists(local_path) or os.path.getsize(local_path) < 50_000_000:
-        url = f"https://drive.google.com/uc?id={file_id}"
-        st.info(f"📥 Downloading {os.path.basename(local_path)}...")
-        gdown.download(url, local_path, quiet=False, fuzzy=True)
-        st.success(f"✅ Downloaded {os.path.basename(local_path)} "
-                   f"({os.path.getsize(local_path)/1e6:.2f} MB)")
-    else:
-        st.info(f"✅ Using cached {os.path.basename(local_path)} "
-                f"({os.path.getsize(local_path)/1e6:.2f} MB)")
-    return joblib.load(local_path)
+def get_models():
+    clf_path = os.path.join(MODELS_DIR, "best_classifier.joblib")
+    reg_path = os.path.join(MODELS_DIR, "best_regressor.joblib")
+    label_enc_path = os.path.join(MODELS_DIR, "label_encoder.joblib")
 
+    missing = []
+    if not os.path.exists(clf_path):
+        missing.append(clf_path)
+    if not os.path.exists(reg_path):
+        missing.append(reg_path)
+    if not os.path.exists(label_enc_path):
+        # label encoder might be inside models but not required to exist separately
+        missing.append(label_enc_path)
 
-# === 🔗 Google Drive File IDs ===
-clf_id = "1HDVTRFddt98iwgPrQJbjYL1ZYxBlhQPI"
-reg_id = "1HWkwyGHbvEydh36Q4Gwzm5H8KYGl92Gj"
+    if missing:
+        # train lightweight models on dataset and save them
+        clf, reg, le = train_and_save_models(df)
+        return clf, reg, le
 
-# === Load Models and Preprocessors ===
-clf = load_model_from_drive(clf_id, "models/best_classifier.joblib")
-reg = load_model_from_drive(reg_id, "models/best_regressor.joblib")
-encoder = joblib.load("models/encoder.joblib")
-scaler = joblib.load("models/scaler.joblib")
-label_encoder = joblib.load("models/label_encoder.joblib")
+    # else load
+    try:
+        clf = joblib.load(clf_path)
+        reg = joblib.load(reg_path)
+        le = joblib.load(label_enc_path)
+        return clf, reg, le
+    except Exception as e:
+        st.error("Error loading model files. Will attempt to retrain.")
+        st.text(traceback.format_exc())
+        clf, reg, le = train_and_save_models(df)
+        return clf, reg, le
 
-st.success("✅ All models and preprocessors loaded successfully!")
+clf, reg, label_encoder = get_models()
+st.success("✅ Models ready.")
 
-# ==========================================================
-# 🧮 User Input Section
-# ==========================================================
+# -------------------------
+# User input UI
+# -------------------------
 st.header("🧮 EMI Eligibility Prediction")
 
 col1, col2 = st.columns(2)
@@ -90,12 +228,11 @@ with col8:
 
 emi_scenario = st.selectbox("EMI Scenario", ["Standard", "Flexible", "High Risk"])
 
-# ==========================================================
-# 🔮 Prediction Section (no manual preprocessing)
-# ==========================================================
+# -------------------------
+# Predict
+# -------------------------
 if st.button("🔍 Predict EMI Eligibility & Limit"):
     try:
-        # ✅ Prepare raw input DataFrame directly for pipeline
         df_raw = pd.DataFrame([{
             "age": age,
             "monthly_salary": salary,
@@ -127,27 +264,40 @@ if st.button("🔍 Predict EMI Eligibility & Limit"):
         st.write("### 🧾 Input Data Sent to Model")
         st.dataframe(df_raw)
 
-        # === Predict EMI Eligibility ===
+        # predict classification
         class_pred_raw = clf.predict(df_raw)
-        class_pred = int(class_pred_raw[0])
-        label = label_encoder.inverse_transform([class_pred])[0]
+        # if label encoder exists, convert back; label_encoder may be sklearn LabelEncoder object
+        try:
+            # if classifier pipeline predicts encoded ints
+            if isinstance(class_pred_raw[0], (np.integer, int)):
+                label = label_encoder.inverse_transform([int(class_pred_raw[0])])[0]
+            else:
+                # if classifier pipeline returns string label directly
+                label = str(class_pred_raw[0])
+        except Exception:
+            # fallback
+            label = str(class_pred_raw[0])
 
         st.markdown("### 🏦 **Predicted EMI Eligibility**")
         if hasattr(clf, "predict_proba"):
-            proba = clf.predict_proba(df_raw)[0]
-            confidence = float(proba[class_pred])
-            st.success(f"{label} ({confidence*100:.1f}% confidence)")
-            st.progress(confidence)
+            try:
+                proba = clf.predict_proba(df_raw)[0]
+                # choose highest-prob index
+                idx = np.argmax(proba)
+                confidence = float(proba[idx])
+                st.success(f"{label} ({confidence*100:.1f}% confidence)")
+                st.progress(confidence)
+            except Exception:
+                st.success(label)
         else:
             st.success(label)
 
-        # === Predict Maximum EMI ===
+        # predict regression (max monthly emi)
         emi_pred_raw = reg.predict(df_raw)
         emi_val = float(emi_pred_raw[0])
         st.markdown("### 💸 **Predicted Maximum Affordable EMI**")
         st.info(f"₹{emi_val:,.0f}")
 
-        # === Summary ===
         st.divider()
         colA, colB = st.columns(2)
         colA.metric("Eligibility", label)
@@ -158,15 +308,13 @@ if st.button("🔍 Predict EMI Eligibility & Limit"):
         st.exception(e)
         st.text(traceback.format_exc())
 
-# ==========================================================
-# 🧠 Debug Info (Expandable)
-# ==========================================================
+# -------------------------
+# Debug Info
+# -------------------------
 with st.expander("🧩 Model & Preprocessing Info"):
     try:
-        if hasattr(clf, "feature_names_in_"):
-            st.write("Classifier features:", list(clf.feature_names_in_))
-        if hasattr(reg, "feature_names_in_"):
-            st.write("Regressor features:", list(reg.feature_names_in_))
+        st.write("Models directory:", os.path.relpath(MODELS_DIR))
+        for fname in sorted(os.listdir(MODELS_DIR)):
+            st.write("-", fname)
     except Exception as e:
         st.exception(e)
-
